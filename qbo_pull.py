@@ -134,6 +134,20 @@ def auth_headers(access_token: str) -> dict:
     return {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
 
 
+def raise_with_tid(resp: requests.Response, context: str) -> None:
+    """
+    Raise on HTTP error, including Intuit's intuit_tid response header in the
+    message. The intuit_tid is a per-request trace ID; Intuit support uses it
+    to locate a specific failed request on their side, so it must appear in
+    the job logs whenever an API call fails.
+    """
+    if resp.status_code >= 400:
+        tid = resp.headers.get("intuit_tid", "n/a")
+        raise RuntimeError(
+            f"{context}: HTTP {resp.status_code} (intuit_tid={tid}) {resp.text[:500]}"
+        )
+
+
 def refresh_access_token(company: dict) -> str:
     client_id = os.environ["QBO_CLIENT_ID"]
     client_secret = os.environ["QBO_CLIENT_SECRET"]
@@ -149,8 +163,10 @@ def refresh_access_token(company: dict) -> str:
         timeout=30,
     )
     if resp.status_code != 200:
+        tid = resp.headers.get("intuit_tid", "n/a")
         raise RuntimeError(
-            f"[{company['name']}] token refresh failed: {resp.status_code} {resp.text}"
+            f"[{company['name']}] token refresh failed: {resp.status_code} "
+            f"(intuit_tid={tid}) {resp.text}"
         )
     tokens = resp.json()
     new_refresh_token = tokens["refresh_token"]
@@ -167,7 +183,7 @@ def fetch_company_info(company: dict, access_token: str) -> dict:
         params={"minorversion": QBO_MINOR_VERSION},
         timeout=30,
     )
-    resp.raise_for_status()
+    raise_with_tid(resp, f"[{company['name']}] company info")
     ci = resp.json().get("CompanyInfo", {})
     return {
         "companyName": ci.get("CompanyName"),
@@ -228,7 +244,7 @@ def fetch_invoices(company: dict, access_token: str, since_date: str) -> list:
             params={"query": query, "minorversion": QBO_MINOR_VERSION},
             timeout=60,
         )
-        resp.raise_for_status()
+        raise_with_tid(resp, f"[{company['name']}] invoice query")
         batch = resp.json().get("QueryResponse", {}).get("Invoice", [])
         if not batch:
             break
@@ -295,7 +311,7 @@ def fetch_income_by_month(company: dict, access_token: str, since_date: str, end
         },
         timeout=60,
     )
-    resp.raise_for_status()
+    raise_with_tid(resp, f"[{company['name']}] ProfitAndLoss report")
     report = resp.json()
     return parse_income_by_month(report), report
 
