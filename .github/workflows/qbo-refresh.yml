@@ -1,0 +1,53 @@
+# Place this file at .github/workflows/qbo-refresh.yml in the repo that
+# hosts qbo_pull.py and requirements.txt.
+#
+# Runs the QBO pull weekday mornings and writes apc-qb.json / pro-qb.json
+# straight to SharePoint (no repo commit involved — nothing here touches
+# git history, so invoice data never lands in the repo).
+
+name: QBO Refresh
+
+on:
+  schedule:
+    # 06:00 America/Los_Angeles. GitHub cron is UTC and does not observe DST,
+    # so this is 13:00 UTC (PDT, most of the year) — shift to 14:00 UTC for PST
+    # winter months if exact timing matters, or just leave it, an hour of
+    # slack doesn't matter for a KPI refresh.
+    - cron: "0 13 * * 1-5"
+  workflow_dispatch: {}   # lets you trigger a manual test run from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  pull-qbo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run QBO pull
+        env:
+          QBO_ENVIRONMENT: production
+          QBO_CLIENT_ID: ${{ secrets.QBO_CLIENT_ID }}
+          QBO_CLIENT_SECRET: ${{ secrets.QBO_CLIENT_SECRET }}
+          QBO_APC_REALM_ID: ${{ secrets.QBO_APC_REALM_ID }}
+          QBO_APC_REFRESH_TOKEN: ${{ secrets.QBO_APC_REFRESH_TOKEN }}
+          QBO_PRO_REALM_ID: ${{ secrets.QBO_PRO_REALM_ID }}
+          QBO_PRO_REFRESH_TOKEN: ${{ secrets.QBO_PRO_REFRESH_TOKEN }}
+          GH_SECRETS_PAT: ${{ secrets.GH_SECRETS_PAT }}
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_SITE_ID: ${{ secrets.SHAREPOINT_SITE_ID }}
+          SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
+          SHAREPOINT_FOLDER_PATH: "KPIs and Reporting/Dashboard"
+        run: python qbo_pull.py
