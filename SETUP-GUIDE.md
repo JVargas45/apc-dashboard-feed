@@ -1,9 +1,26 @@
-# QBO API Feed — Setup Guide
+# QBO API Feed — Setup Guide (v2, updated Jul 21 2026)
 
 This is the "QBO API feed (GitHub Actions cron → SharePoint JSON)" item from
-the project brief's status board. It's a one-time setup (roughly 45-60
-minutes), done by whoever owns the Intuit, Azure/365 admin, and GitHub repo
-accounts — likely three different logins, possibly the same person.
+the project brief's status board. v2 reflects lessons learned during actual
+setup — Intuit's production-key unlock process, the irreversible-scope trap,
+and the GitHub Pages compliance pages, none of which v1 covered.
+
+## Progress checklist (as of Jul 21, 2026)
+
+- [x] GitHub repo `apc-dashboard-feed` created (public, JVargas45)
+- [x] Repo files uploaded: script, workflow, requirements, docs
+- [x] GitHub Pages live: privacy.html, eula.html, index.html
+- [x] Intuit app v2 created — **accounting scope ONLY**
+- [x] `qbo_pull.py` updated to log `intuit_tid` on API errors (make sure the
+      repo copy is the updated one)
+- [~] Intuit production-key unlock: App details + Compliance questionnaire (in progress)
+- [ ] Production redirect URI added (unlocks after Compliance is done)
+- [ ] OAuth consents: APC, then PRO (Step 3 below)
+- [ ] Azure app for SharePoint write (Step 4)
+- [ ] GitHub PAT for secret rotation (Step 5)
+- [ ] GitHub secrets added (Step 6)
+- [ ] First manual test run (Step 7)
+- [ ] Optional but recommended: sandbox dry-run before production consents
 
 ## What this builds
 
@@ -34,148 +51,151 @@ invoice list is what lets the dashboard refresh reconcile QB-billed amounts
 against the wholesale tracker's "shipped" basis, per the brief's flagship
 hygiene check.
 
-**Files in this delivery:**
-- `qbo_pull.py` — the script GitHub Actions runs
-- `get_refresh_token.py` — one-time local helper for the initial OAuth consent (optional — see Step 3)
+**Repo layout** (github.com/JVargas45/apc-dashboard-feed):
+- `qbo_pull.py` — the script GitHub Actions runs (v2: logs intuit_tid on errors)
+- `.github/workflows/qbo-refresh.yml` — weekday-morning cron + manual trigger
+- `get_refresh_token.py` — one-time local helper for OAuth consent (optional; Playground does the same)
 - `requirements.txt` — Python dependencies
-- `qbo-refresh.yml` — the GitHub Actions workflow (copy to `.github/workflows/qbo-refresh.yml`)
+- `docs/` — privacy.html, eula.html, index.html, served via GitHub Pages for Intuit compliance
+- `SETUP-GUIDE.md` — this file
 
----
+## Step 1 — Intuit developer app  ✅ done, lessons recorded
 
-## Step 1 — Create the Intuit developer app
+What we learned the hard way:
 
-1. Go to **https://developer.intuit.com** and sign in (create an Intuit
-   developer account if needed — it's free, separate from your regular QBO login).
-2. **Dashboard → Create an app → QuickBooks Online and Payments**.
-3. Give it a name (e.g. "APC Dashboard Feed"). Select the **Accounting** scope.
-4. Once created, open **Keys & OAuth** for the app:
-   - You'll see **Development** keys (Client ID/Secret for sandbox testing)
-     and a **Production** tab.
-   - Under **Production**, add a **Redirect URI**. For the simplest path,
-     use Intuit's own OAuth Playground redirect:
-     `https://developer.intuit.com/v2/OAuth2Playground/RedirectUrl`
-     (This lets you use Intuit's official Playground tool in Step 3 with
-     zero code. If you'd rather use your own redirect URI, that's fine too —
-     just keep it consistent with what you enter in Step 3.)
-   - Requesting **Production keys** may ask you to fill in some basic app
-     info (this is Intuit's standard flow for apps that will only ever be
-     used by the app owner's own companies, not a public listing — it's
-     usually a short form, not a full review). Follow whatever Intuit's UI
-     currently asks for.
-5. Copy the **Production** Client ID and Client Secret somewhere safe —
-   you'll paste these into GitHub secrets in Step 5. This ONE app/ONE
-   key pair is shared by both APC and PRO.
+- **Scopes are permanent.** Once a scope is added to an app it can never be
+  removed, and scopes apply to both dev and production credentials. The
+  first app accidentally included `com.intuit.quickbooks.payment`; the fix
+  was creating a fresh app with **only `com.intuit.quickbooks.accounting`**.
+  Never add payments to this app.
+- **Production keys are gated.** The Production Client ID/Secret and the
+  Production Redirect URI section are locked until two unlock tasks are
+  complete on the Keys & Credentials page: **App details** (~8 min) and
+  **Compliance** (~40 min questionnaire). Development keys and their
+  redirect URIs are available immediately with no unlock.
+- **Compliance needs public URLs.** The questionnaire requires a publicly
+  reachable Privacy Policy URL, EULA URL, host domain, launch URL,
+  disconnect URL, and connect URL. Ours are served from GitHub Pages:
+  - Privacy: `https://jvargas45.github.io/apc-dashboard-feed/privacy.html`
+  - EULA: `https://jvargas45.github.io/apc-dashboard-feed/eula.html`
+  - Host domain: `jvargas45.github.io`
+  - Launch / Disconnect / Connect URL (all three):
+    `https://jvargas45.github.io/apc-dashboard-feed/`
+- **Hosting answers**: hosted on GitHub (Actions runners on Microsoft Azure
+  + GitHub Pages CDN), United States, no static IP (GitHub Pages resolves
+  to 185.199.108.153 and siblings if a literal IP is forced).
+- **Questionnaire stances** (all truthful for this app): no webhooks, no
+  CDC, no WebSockets; daily API calls (weekday cron); ~4–6 calls per
+  company per run; no retry loops on auth failure; tokens refreshed
+  programmatically once per run; intuit_tid captured in error logs; logs in
+  GitHub Actions (~90-day retention, shareable); no credentials or QBO data
+  in logs; no version-specific QBO features used (core objects only).
 
-*(You can do everything below against the Development/sandbox keys first if
-you want to test the pipeline before touching real company data — just set
-`QBO_ENVIRONMENT=sandbox` and use sandbox company connections. Switch to
-Production keys + `QBO_ENVIRONMENT=production` when you're ready to go live.)*
+Once Compliance completes and Production unlocks:
+
+1. **Keys & Credentials → Production tab** → copy the Production
+   **Client ID** and **Client Secret** (→ GitHub secrets in Step 6).
+2. In the Production **Redirect URIs** section, add:
+   `https://developer.intuit.com/v2/OAuth2Playground/RedirectUrl`
+
+One app / one key pair serves both APC and PRO.
 
 ## Step 2 — Understand what you're about to authorize
 
 QBO's OAuth model: one dev app can connect to many companies, but each
-company connection needs its own **authorization consent** — i.e. someone
-has to log into QuickBooks *as that company* and click "Connect." That's
-why the brief calls for two consents (APC, then PRO) against the one app.
+company connection needs its own **authorization consent** — someone logs
+into QuickBooks *as that company* and clicks "Connect." Hence two consents
+(APC, then PRO) against the one app.
 
 Each consent produces a **realm ID** (QuickBooks' company identifier) and a
-**refresh token**. The refresh token is what lets the script get new access
-tokens indefinitely without a human logging in again — as long as it's used
-at least once every ~100 days, which the weekday cron easily satisfies.
+**refresh token**. The refresh token lets the script get new access tokens
+indefinitely without a human logging in again — provided it's used at least
+once every ~100 days, which the weekday cron easily satisfies. Note QBO
+*rotates* refresh tokens: every use returns a new one, which the script
+automatically persists back into GitHub secrets (that's what the
+`GH_SECRETS_PAT` in Step 5 is for).
 
 ## Step 3 — Authorize APC, then PRO
 
-Do this once per company. Two options — pick whichever's easier:
+Requires production keys (Step 1 complete). Do this once per company.
+Two options:
 
 ### Option A — Intuit's OAuth 2.0 Playground (no code, recommended)
 
 1. Go to **https://developer.intuit.com/app/developer/playground**.
-2. Select your app, select the **Accounting** scope.
+2. Select the app, select the **Accounting** scope.
 3. Click **Get authorization code**, sign into QuickBooks **as the APC
    company**, approve access.
-4. The Playground shows you the **Realm ID** and lets you click **Get
-   tokens** to reveal the **refresh token** directly on the page.
-5. Copy the Realm ID and refresh token → these become
-   `QBO_APC_REALM_ID` and `QBO_APC_REFRESH_TOKEN`.
-6. Repeat, this time signing in **as the PRO company**, to get
-   `QBO_PRO_REALM_ID` and `QBO_PRO_REFRESH_TOKEN`.
+4. The Playground shows the **Realm ID**; click **Get tokens** to reveal
+   the **refresh token**.
+5. Copy both → `QBO_APC_REALM_ID` and `QBO_APC_REFRESH_TOKEN`.
+6. Repeat signed in **as the PRO company** → `QBO_PRO_REALM_ID` and
+   `QBO_PRO_REFRESH_TOKEN`.
+
+**Timing note:** a refresh token obtained here is only guaranteed while
+unused for ~100 days, but more importantly the FIRST use by the script
+rotates it. Do the consents when you're ready to add secrets and run the
+workflow soon after — don't harvest tokens weeks before wiring things up.
 
 ### Option B — `get_refresh_token.py` (scripted, same result)
 
 ```bash
-pip install requests --break-system-packages
+pip install requests
 python get_refresh_token.py
 ```
 
-Follow the prompts (it prints a URL to open in a browser, then asks you to
-paste back the redirected URL). Run it twice — once signed in as APC, once
-as PRO.
+Run twice — once signed in as APC, once as PRO.
 
-Either way, by the end of this step you have **four values**:
-`QBO_APC_REALM_ID`, `QBO_APC_REFRESH_TOKEN`, `QBO_PRO_REALM_ID`,
-`QBO_PRO_REFRESH_TOKEN`.
-
-## Step 4 — Set up SharePoint write access (Microsoft Graph)
+## Step 4 — SharePoint write access (Microsoft Graph)
 
 The script needs its own app registration to write files — separate from
 your normal 365 login, and separate from Claude's read-only 365 connector.
 
-1. In **Azure Portal → Microsoft Entra ID → App registrations → New
-   registration**. Name it something like "APC Dashboard QBO Writer."
-   Single tenant is fine.
+1. **Azure Portal → Microsoft Entra ID → App registrations → New
+   registration**. Name: "APC Dashboard QBO Writer." Single tenant.
 2. **API permissions → Add a permission → Microsoft Graph → Application
-   permissions** → add `Sites.Selected` (preferred, scoped to just this one
-   site) or `Sites.ReadWrite.All` (simpler, broader — fine for an internal
+   permissions** → add `Sites.Selected` (preferred, scoped to one site) or
+   `Sites.ReadWrite.All` (simpler, broader — acceptable for an internal
    tool). Click **Grant admin consent**.
-   - If you use `Sites.Selected`, you also need to grant this specific app
-     `write` access to the one SharePoint site — this requires a separate
-     Graph call (`POST /sites/{site-id}/permissions`) that a 365 admin runs
-     once. Happy to script that too if you want to go the scoped route
-     instead of `Sites.ReadWrite.All`.
-3. **Certificates & secrets → New client secret**. Copy the value
-   immediately (Azure only shows it once) → `SHAREPOINT_CLIENT_SECRET`.
-4. From the app's **Overview** page, copy:
-   - **Application (client) ID** → `SHAREPOINT_CLIENT_ID`
-   - **Directory (tenant) ID** → `SHAREPOINT_TENANT_ID`
-5. Find your **Site ID**: with an admin account, open this in a browser
-   (or Graph Explorer at https://developer.microsoft.com/graph/graph-explorer):
-   ```
-   https://graph.microsoft.com/v1.0/sites/{yourtenant}.sharepoint.com:/sites/{site-name}
-   ```
-   The response's `id` field is your `SHAREPOINT_SITE_ID`. (`SHAREPOINT_DRIVE_ID`
-   is optional — leave it unset and the script will resolve the default
-   document library from the site ID.)
-6. Confirm the exact folder path under the site's document library that
-   matches "KPIs and Reporting → Dashboard" — the workflow file already
-   assumes `KPIs and Reporting/Dashboard`, but double-check against what
-   REFRESH-runbook.md uses for `APC-Dashboard.html`, and adjust the
-   `SHAREPOINT_FOLDER_PATH` value in `qbo-refresh.yml` if it differs.
+   - `Sites.Selected` additionally requires granting this app `write` on
+     the one SharePoint site via a one-time Graph call
+     (`POST /sites/{site-id}/permissions`) by a 365 admin. Ask Claude to
+     script it if going this route.
+3. **Certificates & secrets → New client secret**. Copy immediately (shown
+   once) → `SHAREPOINT_CLIENT_SECRET`. Note its expiry date on a calendar.
+4. From **Overview**: Application (client) ID → `SHAREPOINT_CLIENT_ID`;
+   Directory (tenant) ID → `SHAREPOINT_TENANT_ID`.
+5. **Site ID**: in Graph Explorer
+   (https://developer.microsoft.com/graph/graph-explorer) run:
+   `https://graph.microsoft.com/v1.0/sites/{yourtenant}.sharepoint.com:/sites/{site-name}`
+   — the response `id` → `SHAREPOINT_SITE_ID`. (`SHAREPOINT_DRIVE_ID` is
+   optional; unset, the script uses the site's default document library.)
+6. Confirm the folder path for "KPIs and Reporting → Dashboard." The
+   workflow assumes `KPIs and Reporting/Dashboard` — check against where
+   `APC-Dashboard.html` actually lives and adjust `SHAREPOINT_FOLDER_PATH`
+   in `qbo-refresh.yml` if needed.
 
-## Step 5 — Create a GitHub PAT for secret rotation
+## Step 5 — GitHub PAT for secret rotation
 
-Because QBO rotates refresh tokens on every use, the workflow needs
-permission to update its own secrets after each run.
+QBO rotates refresh tokens on every use, so the workflow must be able to
+update its own secrets after each run.
 
-1. **GitHub → Settings → Developer settings → Fine-grained tokens → Generate new token.**
-2. Scope it to **this one repository only**.
-3. Under **Repository permissions**, set **Secrets** to **Read and write**.
-4. Set an expiration you're comfortable renewing (fine-grained PATs max out
-   at 1 year) — put a reminder on your calendar to rotate it.
-5. Copy the token → this becomes the `GH_SECRETS_PAT` secret itself (yes,
-   a secret that manages other secrets — that's expected here).
+1. **GitHub → Settings → Developer settings → Fine-grained tokens →
+   Generate new token.**
+2. Scope: **only the `apc-dashboard-feed` repository**.
+3. Repository permissions → **Secrets: Read and write**.
+4. Expiration: up to 1 year — calendar a renewal reminder.
+5. Copy the token → becomes the `GH_SECRETS_PAT` secret.
 
-## Step 6 — Add everything to the repo
+## Step 6 — Add GitHub secrets
 
-1. Add `qbo_pull.py` and `requirements.txt` to the repo root (or wherever
-   makes sense for this codebase).
-2. Add `qbo-refresh.yml` at `.github/workflows/qbo-refresh.yml`.
-3. **Repo → Settings → Secrets and variables → Actions → New repository
-   secret**, and add each of these:
+Repo files are already in place. **Repo → Settings → Secrets and variables
+→ Actions → New repository secret** for each:
 
 | Secret name | Value from |
 |---|---|
-| `QBO_CLIENT_ID` | Step 1 |
-| `QBO_CLIENT_SECRET` | Step 1 |
+| `QBO_CLIENT_ID` | Step 1 (Production) |
+| `QBO_CLIENT_SECRET` | Step 1 (Production) |
 | `QBO_APC_REALM_ID` | Step 3 |
 | `QBO_APC_REFRESH_TOKEN` | Step 3 |
 | `QBO_PRO_REALM_ID` | Step 3 |
@@ -187,50 +207,65 @@ permission to update its own secrets after each run.
 | `SHAREPOINT_SITE_ID` | Step 4 |
 | `SHAREPOINT_DRIVE_ID` | Step 4 (optional) |
 
-Nothing here gets committed to git history — the script writes the two
-JSON files to the runner's temp workspace and pushes them straight to
-SharePoint; they never touch the repo itself.
+No QuickBooks data or credentials ever enter the repo or its history — the
+JSON goes straight from the runner to SharePoint, and secrets live only in
+GitHub's encrypted store.
+
+## Optional Step 6.5 — Sandbox dry-run (recommended)
+
+Validates the whole pipeline before real books are involved, and makes the
+"have you tested error handling" compliance answer concretely true:
+
+1. Keys & Credentials → **Development** tab → copy dev Client ID/Secret;
+   add the Playground redirect URI under Development Redirect URIs.
+2. Find your **sandbox company** (auto-created with the developer account,
+   under the API/Sandbox menu).
+3. Do one Playground consent against the sandbox company.
+4. Temporarily set secrets: dev `QBO_CLIENT_ID`/`QBO_CLIENT_SECRET`,
+   sandbox realm/token in the APC slots, and add a repo **variable or
+   temporary edit** `QBO_ENVIRONMENT: sandbox` in the workflow env. Set
+   `SKIP_SHAREPOINT_UPLOAD: "true"` if Step 4 isn't done yet.
+5. Actions → QBO Refresh → **Run workflow**. Expect PRO to fail (no
+   sandbox token in its slots) — that's fine, it also proves per-company
+   error isolation works.
+6. Revert env to production values afterward.
 
 ## Step 7 — Test before trusting the cron
 
-1. **Repo → Actions → QBO Refresh → Run workflow** (this works because of
-   the `workflow_dispatch` trigger in the yml).
-2. Watch the log. First-run things to check:
+1. **Repo → Actions → QBO Refresh → Run workflow.**
+2. In the log, confirm:
    - Both companies process without error.
-   - The line `Rotated refresh token persisted to GitHub secret ...` appears
-     for each company (confirms Step 5 is wired up correctly).
-   - `apc-qb.json` / `pro-qb.json` show up in the SharePoint Dashboard
-     folder with a recent timestamp.
-3. Open one of the JSON files and sanity check: company name matches,
-   invoice count looks plausible, a handful of invoices have the right
-   customer/amount/date.
-4. If `incomeByMonth` comes back empty, the P&L report parsing likely needs
-   a small adjustment — see the comment above `parse_income_by_month` in
-   `qbo_pull.py`. The raw report is preserved under `profitAndLossRaw` in
-   the JSON either way, so nothing is lost while that gets tuned.
-5. Once a manual run looks right, leave the cron schedule as-is (weekday
-   mornings) — no further action needed.
+   - `Rotated refresh token persisted to GitHub secret ...` appears for
+     each company (proves Step 5 works — without this the NEXT run fails).
+   - `apc-qb.json` / `pro-qb.json` appear in the SharePoint Dashboard
+     folder with fresh timestamps.
+3. Open a JSON: company name right, invoice count plausible, spot-check a
+   few invoices.
+4. If `incomeByMonth` is empty, the P&L parse needs a tweak — see the
+   comment above `parse_income_by_month` in `qbo_pull.py`; the raw report
+   is preserved under `profitAndLossRaw` so nothing is lost meanwhile.
+5. Good manual run → leave the weekday cron alone; done.
 
 ## After this is live
 
-Per the brief, the next step is updating `REFRESH-runbook.md` so the
-dashboard refresh process pulls from `apc-qb.json` / `pro-qb.json` instead
-of showing QB data as sample-badged. That's a small edit to the runbook,
-not covered here — flag it when you're ready and it can be done as part of
-a normal refresh pass.
+Update `REFRESH-runbook.md` (on SharePoint) so the dashboard refresh reads
+`apc-qb.json` / `pro-qb.json` instead of sample-badged QB data, and flip
+the QB status dot from 🔴 sample. Small edit, done as part of a normal
+refresh pass — flag it when ready.
 
 ## Troubleshooting
 
-- **401 on token refresh** — the refresh token was invalidated (used past
-  its ~100 day life, or revoked in Intuit's connected-apps list). Re-run
-  Step 3 for that company.
-- **403 from SharePoint upload** — admin consent wasn't granted in Step 4,
-  or (if using `Sites.Selected`) the app wasn't separately granted access
-  to this specific site.
-- **Workflow succeeds but next scheduled run fails on token refresh** — the
-  `GH_SECRETS_PAT` is missing, expired, or scoped to the wrong repo/permission
-  — check the WARNING line in the previous run's log, it calls this out
-  explicitly.
-- **Rate limits** — QBO's API allows 500 requests/minute per app across all
-  realms in production; a weekday-morning run for two companies is nowhere
-  close to that ceiling.
+- **401 on token refresh** — refresh token invalidated (unused past ~100
+  days, revoked in Intuit's connected apps, or a rotated token failed to
+  persist). Re-run Step 3 for that company.
+- **`invalid_grant`** — same causes/remedy as above; also check the right
+  realm's token is in the right secret slot.
+- **403 from SharePoint upload** — admin consent missing in Step 4, or
+  (with `Sites.Selected`) the per-site grant wasn't done.
+- **Run succeeds but the NEXT run fails auth** — token rotation didn't
+  persist: `GH_SECRETS_PAT` missing/expired/mis-scoped. The prior run's log
+  contains an explicit WARNING when this is the case.
+- **Errors include `intuit_tid=`** — that's Intuit's per-request trace ID;
+  quote it if you ever contact Intuit developer support.
+- **Rate limits** — QBO allows 500 req/min per app in production; this
+  feed uses ~10/day. Not a concern.
