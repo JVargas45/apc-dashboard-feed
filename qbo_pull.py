@@ -339,12 +339,34 @@ def get_graph_token() -> str:
     return resp.json()["access_token"]
 
 
+def resolve_drive_id(token: str, site_id: str, library_name: str) -> str:
+    """Find the drive (document library) on the site whose name matches library_name."""
+    resp = requests.get(
+        f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    drives = resp.json().get("value", [])
+    for drive in drives:
+        if drive.get("name", "").strip().lower() == library_name.strip().lower():
+            return drive["id"]
+    available = [d.get("name") for d in drives]
+    raise RuntimeError(
+        f"No document library named '{library_name}' on site. Available: {available}"
+    )
+
+
 def upload_to_sharepoint(filename: str, payload: dict) -> None:
     site_id = os.environ["SHAREPOINT_SITE_ID"]
     drive_id = os.environ.get("SHAREPOINT_DRIVE_ID")
+    library_name = os.environ.get("SHAREPOINT_LIBRARY_NAME")
     folder_path = os.environ.get("SHAREPOINT_FOLDER_PATH", "Dashboard").strip("/")
     token = get_graph_token()
     body = json.dumps(payload, indent=2).encode("utf-8")
+
+    if not drive_id and library_name:
+        drive_id = resolve_drive_id(token, site_id, library_name)
 
     if drive_id:
         url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{folder_path}/{filename}:/content"
