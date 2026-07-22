@@ -211,6 +211,7 @@ def simplify_invoice(inv: dict) -> dict:
                     "description": line.get("Description"),
                     "amount": line.get("Amount"),
                     "item": detail.get("ItemRef", {}).get("name"),
+                    "class": detail.get("ClassRef", {}).get("name"),
                 }
             )
     customer_ref = inv.get("CustomerRef", {})
@@ -253,6 +254,24 @@ def fetch_invoices(company: dict, access_token: str, since_date: str) -> list:
             break
         start_position += page_size
     return invoices
+
+
+def fetch_bank_balances(company: dict, access_token: str) -> list:
+    """Cash position: every Bank-type account with its current balance."""
+    url = f"{QBO_API_BASE}/v3/company/{company['realm_id']}/query"
+    query = "SELECT Name, CurrentBalance FROM Account WHERE AccountType = 'Bank'"
+    resp = requests.get(
+        url,
+        headers=auth_headers(access_token),
+        params={"query": query, "minorversion": QBO_MINOR_VERSION},
+        timeout=30,
+    )
+    raise_with_tid(resp, f"[{company['name']}] bank accounts")
+    accounts = resp.json().get("QueryResponse", {}).get("Account", [])
+    return [
+        {"name": a.get("Name"), "balance": a.get("CurrentBalance", 0)}
+        for a in accounts
+    ]
 
 
 def find_row_by_label(rows: list, label: str):
@@ -314,6 +333,102 @@ def fetch_income_by_month(company: dict, access_token: str, since_date: str, end
     raise_with_tid(resp, f"[{company['name']}] ProfitAndLoss report")
     report = resp.json()
     return parse_income_by_month(report), report
+
+
+def parse_pl_line_by_month(report: dict, label: str) -> list:
+    """Extract any labeled summary row (e.g. 'Total Expenses', 'Net Income') by month."""
+    columns = report.get("Columns", {}).get("Column", [])
+    month_labels = [c.get("ColTitle", "") for c in columns]
+    row = find_row_by_label(report.get("Rows", {}).get("Row", []), label)
+    if not row:
+        return []
+    col_data = row.get("Summary", {}).get("ColData") or row.get("ColData") or []
+    results = []
+    for lbl, cell in zip(month_labels, col_data):
+        if not lbl or lbl.strip().lower() == "total":
+            continue
+        try:
+            value = float(cell.get("value") or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        results.append({"month": lbl, "value": value})
+    return results
+
+
+def build_summary(invoices: list, income_by_month: list, raw_report, bank_accounts: list) -> dict:
+    """
+    Precomputed aggregates so dashboard refreshes read a small block instead of
+    re-deriving from thousands of invoices. All derivable client-side, computed
+    here once for cheapness and consistency.
+    """
+    today = date.today()
+
+    def d(s):
+        from datetime import datetime as _dt
+        return _dt.strptime(s, "%Y-%m-%d").date() if s else None
+
+    # A/R aging (by due date; falls back to txn date)
+    aging = {"current": 0.0, "d1_30": 0.0, "d31_60": 0.0, "d60_plus": 0.0}
+    open_invoices = [i for i in invoices if (i.get("balance") or 0) > 0]
+    aged_60_plus = []
+    for i in open_invoices:
+        due = d(i.get("dueDate")) or d(i["txnDate"])
+        days_past = (today - due).days
+        if days_past <= 0:
+            aging["current"] += i["balance"]
+        elif days_past <= 30:
+            aging["d1_30"] += i["balance"]
+        elif days_past <= 60:
+            aging["d31_60"] += i["balance"]
+        else:
+            aging["d60_plus"] += i["balance"]
+            aged_60_plus.append(
+                {"customer": i.get("customer"), "docNumber": i.get("docNumber"),
+                 "dueDate": i.get("dueDate"), "balance": i["balance"]}
+            )
+    aged_60_plus.sort(key=lambda x: -x["balance"])
+
+    # Billed by month + by class (from invoice lines; unclassified lines under 'Unclassified')
+    billed_by_month = {}
+    billed_by_class_month = {}
+    for i in invoices:
+        month_key = i["txnDate"][:7]  # YYYY-MM
+        m = billed_by_month.setdefault(month_key, {"amount": 0.0, "invoices": 0})
+        m["amount"] += i.get("totalAmt") or 0
+        m["invoices"] += 1
+        for line in i.get("lines", []):
+            cls = line.get("class") or "Unclassified"
+            billed_by_class_month.setdefault(month_key, {}).setdefault(cls, 0.0)
+            billed_by_class_month[month_key][cls] += line.get("amount") or 0
+
+    expenses_by_month, net_income_by_month = [], []
+    if raw_report:
+        expenses_by_month = parse_pl_line_by_month(raw_report, "Total Expenses")
+        net_income_by_month = parse_pl_line_by_month(raw_report, "Net Income")
+
+    return {
+        "cash": {
+            "total": round(sum(a["balance"] or 0 for a in bank_accounts), 2),
+            "accounts": bank_accounts,
+        },
+        "ar": {
+            "totalOutstanding": round(sum(i["balance"] for i in open_invoices), 2),
+            "openInvoiceCount": len(open_invoices),
+            "aging": {k: round(v, 2) for k, v in aging.items()},
+            "aged60PlusTop": aged_60_plus[:15],
+            "aged60PlusCount": len(aged_60_plus),
+        },
+        "billedByMonth": {
+            k: {"amount": round(v["amount"], 2), "invoices": v["invoices"]}
+            for k, v in sorted(billed_by_month.items())
+        },
+        "billedByClassMonth": {
+            mk: {c: round(a, 2) for c, a in sorted(classes.items())}
+            for mk, classes in sorted(billed_by_class_month.items())
+        },
+        "expensesByMonth": expenses_by_month,
+        "netIncomeByMonth": net_income_by_month,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -402,10 +517,18 @@ def process_company(company: dict) -> None:
     invoices = fetch_invoices(company, access_token, since)
 
     try:
+        bank_accounts = fetch_bank_balances(company, access_token)
+    except Exception as exc:  # noqa: BLE001 - cash card is optional, don't kill the run
+        print(f"WARNING: bank balance pull failed for {company['name']}: {exc}")
+        bank_accounts = []
+
+    try:
         income_by_month, raw_report = fetch_income_by_month(company, access_token, since, today)
     except Exception as exc:  # noqa: BLE001 - want to keep going even if P&L pull fails
         print(f"WARNING: income-by-month pull failed for {company['name']}: {exc}")
         income_by_month, raw_report = [], None
+
+    summary = build_summary(invoices, income_by_month, raw_report, bank_accounts)
 
     payload = {
         "realm": company["name"],
@@ -413,6 +536,7 @@ def process_company(company: dict) -> None:
         "environment": QBO_ENV,
         "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "companyInfo": company_info,
+        "summary": summary,
         "incomeByMonth": income_by_month,
         "invoices": invoices,
         "profitAndLossRaw": raw_report,
@@ -420,6 +544,7 @@ def process_company(company: dict) -> None:
             "invoiceCount": len(invoices),
             "lookbackMonths": LOOKBACK_MONTHS,
             "pulledThrough": today,
+            "schemaVersion": 3,
         },
     }
 
