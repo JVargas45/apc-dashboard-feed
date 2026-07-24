@@ -256,22 +256,39 @@ def fetch_invoices(company: dict, access_token: str, since_date: str) -> list:
     return invoices
 
 
-def fetch_bank_balances(company: dict, access_token: str) -> list:
-    """Cash position: every Bank-type account with its current balance."""
+def fetch_accounts_of_type(company: dict, access_token: str, account_type: str) -> list:
+    """Accounts of a given AccountType with balance + subtype.
+
+    Subtype is pulled so mistyped accounts are visible in the JSON (e.g. a
+    credit card sitting in AccountType='Bank' — the kind of chart-of-accounts
+    error that corrupts the cash card). Surfaced, never silently corrected.
+    """
     url = f"{QBO_API_BASE}/v3/company/{company['realm_id']}/query"
-    query = "SELECT Name, CurrentBalance FROM Account WHERE AccountType = 'Bank'"
+    query = (
+        "SELECT Name, CurrentBalance, AccountSubType FROM Account "
+        f"WHERE AccountType = '{account_type}'"
+    )
     resp = requests.get(
         url,
         headers=auth_headers(access_token),
         params={"query": query, "minorversion": QBO_MINOR_VERSION},
         timeout=30,
     )
-    raise_with_tid(resp, f"[{company['name']}] bank accounts")
+    raise_with_tid(resp, f"[{company['name']}] {account_type} accounts")
     accounts = resp.json().get("QueryResponse", {}).get("Account", [])
     return [
-        {"name": a.get("Name"), "balance": a.get("CurrentBalance", 0)}
+        {
+            "name": a.get("Name"),
+            "balance": a.get("CurrentBalance", 0),
+            "subType": a.get("AccountSubType"),
+        }
         for a in accounts
     ]
+
+
+def fetch_bank_balances(company: dict, access_token: str) -> list:
+    """Cash position: every Bank-type account with its current balance."""
+    return fetch_accounts_of_type(company, access_token, "Bank")
 
 
 def find_row_by_label(rows: list, label: str):
@@ -355,7 +372,8 @@ def parse_pl_line_by_month(report: dict, label: str) -> list:
     return results
 
 
-def build_summary(invoices: list, income_by_month: list, raw_report, bank_accounts: list) -> dict:
+def build_summary(invoices: list, income_by_month: list, raw_report, bank_accounts: list,
+                  credit_card_accounts: list | None = None) -> dict:
     """
     Precomputed aggregates so dashboard refreshes read a small block instead of
     re-deriving from thousands of invoices. All derivable client-side, computed
@@ -406,10 +424,23 @@ def build_summary(invoices: list, income_by_month: list, raw_report, bank_accoun
         expenses_by_month = parse_pl_line_by_month(raw_report, "Total Expenses")
         net_income_by_month = parse_pl_line_by_month(raw_report, "Net Income")
 
+    # Flag anomalies for the dashboard's Needs Attention panel — a negative
+    # bank balance is almost always a books problem (unreconciled register,
+    # deposits parked in Undeposited Funds, duplicated expenses) or a
+    # mistyped account, not a real overdraft. Surface it, don't hide it.
+    cash_flags = [
+        f"{a['name']} has a negative book balance ({a['balance']:.2f})"
+        + (f" — subtype '{a.get('subType')}'" if a.get("subType") else "")
+        for a in bank_accounts
+        if (a.get("balance") or 0) < 0
+    ]
+
     return {
         "cash": {
             "total": round(sum(a["balance"] or 0 for a in bank_accounts), 2),
             "accounts": bank_accounts,
+            "creditCards": credit_card_accounts or [],
+            "flags": cash_flags,
         },
         "ar": {
             "totalOutstanding": round(sum(i["balance"] for i in open_invoices), 2),
@@ -523,12 +554,18 @@ def process_company(company: dict) -> None:
         bank_accounts = []
 
     try:
+        credit_cards = fetch_accounts_of_type(company, access_token, "Credit Card")
+    except Exception as exc:  # noqa: BLE001 - diagnostic only
+        print(f"WARNING: credit card account pull failed for {company['name']}: {exc}")
+        credit_cards = []
+
+    try:
         income_by_month, raw_report = fetch_income_by_month(company, access_token, since, today)
     except Exception as exc:  # noqa: BLE001 - want to keep going even if P&L pull fails
         print(f"WARNING: income-by-month pull failed for {company['name']}: {exc}")
         income_by_month, raw_report = [], None
 
-    summary = build_summary(invoices, income_by_month, raw_report, bank_accounts)
+    summary = build_summary(invoices, income_by_month, raw_report, bank_accounts, credit_cards)
 
     payload = {
         "realm": company["name"],
