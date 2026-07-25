@@ -30,6 +30,12 @@ Required environment variables:
     TRACKER_RES_ITEM_ID     - item id of Residential Sales Tracker.xlsx
     TRACKER_WS_ITEM_ID      - item id of Wholesale Sales Tracker.xlsx
 
+Optional (leads feed — added in schema v2):
+    TRACKER_LEADS_ITEM_ID   - item id of Residential Leads Tracker.xlsx.
+                              If unset, the leads block is skipped with a note
+                              (the rest of the feed still runs). A leads-read
+                              failure likewise never fails the whole run.
+
 Optional:
     SHIPPER_ROW_CAP         - max Shipper rows to read (default 5000)
     ROWS_PER_REQUEST        - chunk size for range reads (default 500)
@@ -54,6 +60,7 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 DRIVE_ID = os.environ.get("TRACKER_DRIVE_ID")
 RES_ITEM_ID = os.environ.get("TRACKER_RES_ITEM_ID")
 WS_ITEM_ID = os.environ.get("TRACKER_WS_ITEM_ID")
+LEADS_ITEM_ID = os.environ.get("TRACKER_LEADS_ITEM_ID")
 SHIPPER_ROW_CAP = int(os.environ.get("SHIPPER_ROW_CAP", "5000"))
 ROWS_PER_REQUEST = int(os.environ.get("ROWS_PER_REQUEST", "500"))
 
@@ -469,6 +476,173 @@ def shipper_payload(sheet: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Residential Leads Tracker (schema v2)
+# ---------------------------------------------------------------------------
+#
+# Why this block exists: M365 connector reads of the leads workbook miss the
+# hidden current-month detail rows (observed Jul 24: raw dump showed 2 July
+# leads, the tracker's own pivot said 21). Graph range reads include hidden
+# rows, which unlocks weekly lead counts (runbook §3e).
+#
+# The workbook may hold one detail sheet or one per year, plus pivot sheets
+# and a pasted HubSpot contact-export block. Strategy: scan EVERY worksheet
+# for a leads-shaped header row (DATE + LAST NAME + SOURCE), skip anything
+# that looks like a HubSpot export (EMAIL / CONTACT OWNER in the header) or
+# a pivot ("COUNT OF" in the header), and keep only sheets that yield rows
+# with a real lead date.
+
+# Order matters: specific tokens before generic ones ("SOLD DATE" before
+# "SOLD", "DATE QUALIFIED" before "DATE") — the claimed set does the rest.
+LEADS_HEADER_MAP = [
+    ("DATE QUALIFIED", "dateQualified"),
+    ("ESTIMATE DATE", "estimateDate"),
+    ("ESTIMATE VALUE", "estimateValue"),
+    ("SOLD DATE", "soldDate"),
+    ("SOLD VALUE", "soldValue"),
+    ("FIRST NAME", "firstName"),
+    ("LAST NAME", "lastName"),
+    ("SUBCATEGORY", "subcategory"),
+    ("SOURCE", "source"),
+    ("CITY", "city"),
+    ("NOTES", "notes"),
+    ("SOLD", "soldFlag"),
+    ("DATE", "date"),
+]
+LEADS_DATE_FIELDS = {"date", "dateQualified", "estimateDate", "soldDate"}
+LEADS_MONEY_FIELDS = {"estimateValue", "soldValue"}
+
+
+def find_leads_header(values: list, max_scan: int = 15):
+    """Locate a leads detail header row; return (index, colmap) or None."""
+    for idx, row in enumerate(values[:max_scan]):
+        uppers = [str(c).upper() for c in row if c not in (None, "")]
+        if not uppers:
+            continue
+        # Disqualifiers: HubSpot contact exports and pivot tables
+        if any("EMAIL" in u or "CONTACT OWNER" in u or "COUNT OF" in u for u in uppers):
+            continue
+        needed = ["DATE", "LAST NAME", "SOURCE"]
+        if sum(1 for t in needed if any(t in u for u in uppers)) < 3:
+            continue
+        colmap, claimed = {}, set()
+        for token, field in LEADS_HEADER_MAP:
+            for ci, cell in enumerate(row):
+                if ci in claimed or cell in (None, ""):
+                    continue
+                if token in str(cell).upper():
+                    colmap[field] = ci
+                    claimed.add(ci)
+                    break
+        if all(f in colmap for f in ("date", "lastName", "source")):
+            return idx, colmap
+    return None
+
+
+def normalize_leads_sheet(sheet_name: str, sheet: dict):
+    """Parse one worksheet's leads rows. Returns list (possibly empty)."""
+    found = find_leads_header(sheet["values"])
+    if not found:
+        return []
+    h, colmap = found
+
+    def cell(row, field):
+        ci = colmap.get(field)
+        if ci is None or ci >= len(row):
+            return None
+        return row[ci]
+
+    leads = []
+    for row in sheet["values"][h + 1:]:
+        if row_is_empty(row):
+            continue
+        lead = {"sheet": sheet_name}
+        for _, field in LEADS_HEADER_MAP:
+            raw = cell(row, field)
+            if field in LEADS_DATE_FIELDS:
+                lead[field] = to_iso_date(raw)
+            elif field in LEADS_MONEY_FIELDS:
+                lead[field] = to_money(raw)
+            else:
+                lead[field] = to_str(raw)
+        # keep only real lead rows: need a lead date plus a name or source
+        # (drops spacer/summary rows and any stray non-lead content below)
+        if not lead.get("date") or not (lead.get("lastName") or lead.get("source")):
+            continue
+        # derived booleans matching the tracker pivot's semantics
+        flag = (lead.get("soldFlag") or "").strip().lower()
+        lead["hasEstimate"] = bool(lead.get("estimateDate") or lead.get("estimateValue"))
+        lead["isSold"] = bool(lead.get("soldDate")) or flag in (
+            "yes", "y", "x", "1", "true", "sold")
+        leads.append(lead)
+    return leads
+
+
+def week_ending(iso: str) -> str:
+    """ISO date -> the Sunday ending that Mon–Sun week (meetings run Monday)."""
+    d = date.fromisoformat(iso)
+    return (d + timedelta(days=6 - d.weekday())).isoformat()
+
+
+def leads_summary(leads: list) -> dict:
+    by_month, by_week, funnel = {}, {}, {}
+    for l in leads:
+        mk = month_key(l["date"])
+        by_month[mk] = by_month.get(mk, 0) + 1
+        wk = week_ending(l["date"])
+        by_week[wk] = by_week.get(wk, 0) + 1
+        yr = l["date"][:4]
+        src = l.get("source") or "(blank)"
+        f = funnel.setdefault(yr, {}).setdefault(
+            src, {"leads": 0, "estimates": 0, "sold": 0, "soldValue": 0.0})
+        f["leads"] += 1
+        if l["hasEstimate"]:
+            f["estimates"] += 1
+        if l["isSold"]:
+            f["sold"] += 1
+            f["soldValue"] = round(f["soldValue"] + (l.get("soldValue") or 0), 2)
+    return {
+        "leadsByMonth": dict(sorted(by_month.items())),
+        "leadsByWeek": dict(sorted(by_week.items())),
+        "sourceFunnelByYear": {y: dict(sorted(m.items())) for y, m in sorted(funnel.items())},
+    }
+
+
+def pull_leads(token: str, notes: list):
+    """Read the leads workbook. Never raises — failures become meta notes."""
+    if not LEADS_ITEM_ID:
+        notes.append("TRACKER_LEADS_ITEM_ID not set — leads block skipped")
+        print("--- Residential Leads Tracker: env var not set, skipping ---")
+        return None
+    try:
+        print("--- Residential Leads Tracker ---")
+        sheets = list_worksheets(token, LEADS_ITEM_ID)
+        all_leads, parsed_sheets = [], []
+        for s in sheets:
+            sheet = read_sheet(token, LEADS_ITEM_ID, s["name"])
+            rows = normalize_leads_sheet(s["name"], sheet)
+            if rows:
+                all_leads.extend(rows)
+                parsed_sheets.append({"name": s["name"], "leads": len(rows)})
+                print(f"  [{s['name']}] parsed {len(rows)} leads")
+        if not all_leads:
+            notes.append("Leads tracker: no leads-shaped sheet found — check header "
+                         f"tokens. Worksheets: {[s['name'] for s in sheets]}")
+            return None
+        all_leads.sort(key=lambda l: l["date"])
+        return {
+            "sourceFile": "Residential Leads Tracker.xlsx",
+            "worksheetsParsed": parsed_sheets,
+            "hiddenRowsIncluded": True,
+            "leads": all_leads,
+            "summary": leads_summary(all_leads),
+        }
+    except Exception as exc:  # noqa: BLE001 — leads must never fail the feed
+        notes.append(f"Leads tracker read FAILED (feed otherwise ok): {exc}")
+        print(f"  LEADS READ FAILED (continuing): {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -526,9 +700,12 @@ def main() -> None:
                      f"phantom bloat, re-trim per runbook §3b; if real data, raise "
                      f"SHIPPER_ROW_CAP")
 
+    # --- Leads (schema v2, additive; never fails the run) --------------------
+    leads = pull_leads(token, notes)
+
     payload = {
         "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "residential": residential,
         "wholesale": {
             "sourceFile": "Wholesale Sales Tracker.xlsx",
@@ -536,6 +713,7 @@ def main() -> None:
             "kpiDashboard": kpi,
             "shipper": shipper,
         },
+        "leads": leads,
         "meta": {"shipperRowCap": SHIPPER_ROW_CAP, "notes": notes},
     }
 
