@@ -1,19 +1,26 @@
 # Place this file at .github/workflows/qbo-refresh.yml in the repo that
 # hosts qbo_pull.py and requirements.txt.
 #
-# Runs the QBO pull weekday mornings and writes apc-qb.json / pro-qb.json
-# straight to SharePoint (no repo commit involved — nothing here touches
-# git history, so invoice data never lands in the repo).
+# Runs the QBO pull nightly and writes apc-qb.json / pro-qb.json straight to
+# SharePoint (no repo commit involved — nothing here touches git history, so
+# invoice data never lands in the repo).
 
 name: Data Refresh (QBO + Trackers)
 
 on:
   schedule:
-    # 06:00 America/Los_Angeles. GitHub cron is UTC and does not observe DST,
-    # so this is 13:00 UTC (PDT, most of the year) — shift to 14:00 UTC for PST
-    # winter months if exact timing matters, or just leave it, an hour of
-    # slack doesn't matter for a KPI refresh.
-    - cron: "0 13 * * 1-5"
+    # 09:00 UTC daily = 02:00 PDT / 01:00 PST. GitHub cron is UTC and does not
+    # observe DST; either local time is fine here and we deliberately do NOT
+    # chase the DST shift.
+    #
+    # WHY 2am: the team edits the tracker workbooks all day starting ~5am PT.
+    # Snapshotting while nobody is editing means the dashboard always shows a
+    # COMPLETE prior day instead of a half-entered current one. The frontend
+    # labels the data "as of end of <prior day>" on that basis.
+    #
+    # WHY DAILY (not 1-5): a weekday-only cron leaves Monday morning showing
+    # Friday's numbers. Running Sat/Sun means Monday reflects weekend entries.
+    - cron: "0 9 * * *"
   workflow_dispatch: {}   # lets you trigger a manual test run from the Actions tab
 
 permissions:
