@@ -9,18 +9,18 @@ name: Data Refresh (QBO + Trackers)
 
 on:
   schedule:
-    # 09:00 UTC daily = 02:00 PDT / 01:00 PST. GitHub cron is UTC and does not
-    # observe DST; either local time is fine here and we deliberately do NOT
-    # chase the DST shift.
+    # 07:00 UTC daily = midnight PDT. Scheduled earlier than needed because GitHub
+    # cron routinely starts 1-3h late; this keeps even a delayed run finishing
+    # before the team starts editing (~5am PT).
     #
-    # WHY 2am: the team edits the tracker workbooks all day starting ~5am PT.
+    # WHY Midnight: the team edits the tracker workbooks all day starting ~5am PT.
     # Snapshotting while nobody is editing means the dashboard always shows a
     # COMPLETE prior day instead of a half-entered current one. The frontend
     # labels the data "as of end of <prior day>" on that basis.
     #
     # WHY DAILY (not 1-5): a weekday-only cron leaves Monday morning showing
     # Friday's numbers. Running Sat/Sun means Monday reflects weekend entries.
-    - cron: "0 9 * * *"
+    - cron: "0 7 * * *"
   workflow_dispatch: {}   # lets you trigger a manual test run from the Actions tab
 
 permissions:
