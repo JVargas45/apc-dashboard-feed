@@ -518,12 +518,16 @@ def build_summary(invoices: list, income_by_month: list, raw_report, bank_accoun
         net_income_by_month = parse_pl_line_by_month(raw_report, "Net Income")
 
     # Commercial revenue by month, read from the P&L INCOME ACCOUNT (4200) rather
-    # than the invoice CLASS field. QBO's Commercial class is applied
-    # inconsistently — June 2026's commercial invoices are classed and tie to the
-    # account exactly, July's largely are not — so
-    # billedByClassMonth["Commercial"] understates the segment and cannot carry a
-    # QTD/YTD series. Account 4200 is the reliable lens and is what the
-    # dashboard's Commercial goal bar reads.
+    # than the invoice CLASS field.
+    #
+    # WHY: commercial invoices get classed LATE in the month, not incorrectly. On
+    # 2026-07-25 the Commercial class read $583.10 against an account balance of
+    # $20,327.03 — the invoices existed, unclassed. At July close both read
+    # $20,327.03 exactly, and June ties exactly too ($19,743.93). So
+    # billedByClassMonth["Commercial"] is trustworthy only for CLOSED months, which
+    # is useless for a dashboard read mid-month. Account 4200 is correct in real
+    # time and carries the full history in one field, so it is what the dashboard's
+    # Commercial goal bar reads on every time frame.
     #
     # APC only. PRO's "4200 Commercial-4200" is a DIFFERENT account (commercial
     # installation revenue) on a different chart of accounts, and nothing in the
