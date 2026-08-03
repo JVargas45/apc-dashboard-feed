@@ -372,8 +372,101 @@ def parse_pl_line_by_month(report: dict, label: str) -> list:
     return results
 
 
+def _pl_month_keys(report: dict) -> list:
+    """
+    Column index -> "YYYY-MM" for a month-summarized QBO report, taken from each
+    column's StartDate metadata rather than its title.
+
+    Titles are NOT parseable as month keys: the in-progress month is titled with
+    its partial range ("Jul 1-25, 2026"), and the trailing total column is just
+    "Total". StartDate is always an ISO date. Non-month columns (the leading
+    Account column, the trailing Total) map to None so callers can skip them.
+    """
+    keys = []
+    for col in report.get("Columns", {}).get("Column", []):
+        start = next(
+            (m.get("Value") for m in col.get("MetaData", []) if m.get("Name") == "StartDate"),
+            None,
+        )
+        keys.append(start[:7] if start else None)
+    return keys
+
+
+# Account 4200 is APC's commercial revenue account ("4200 Commercial Sales").
+# Matched by label so a chart-of-accounts renumber or rename only needs a hint
+# added here — never by fixed row position.
+#
+# CAUTION: these hints are APC-specific. PRO's chart of accounts has its own,
+# unrelated "4200 Commercial-4200" (commercial installation revenue), which the
+# "4200" hint also matches. The realm == "APC" gate in build_summary is what keeps
+# the two apart — do not reuse this helper for PRO without picking PRO's own labels.
+COMMERCIAL_ACCOUNT_HINTS = ("4200", "commercial sales")
+
+
+def _label_matches(label, hints: tuple) -> bool:
+    """
+    True if a P&L row label names one of the hinted accounts. QBO prefixes a
+    section's summary row with "Total ", which is stripped before matching so
+    "Total 4200 Commercial Sales" and "4200 Commercial Sales" both hit.
+    """
+    if not label:
+        return False
+    text = str(label).strip()
+    if text.lower().startswith("total "):
+        text = text[len("total "):]
+    text = text.lower()
+    return any(hint in text for hint in hints)
+
+
+def parse_pl_account_by_month(report: dict, hints: tuple) -> dict:
+    """
+    Monthly values for one P&L income/expense account, as {"YYYY-MM": float}.
+
+    The account may be a leaf row or a parent section. For a section we return its
+    Summary row ("Total 4200 Commercial Sales") — the account plus its sub-accounts,
+    which is the figure the P&L itself reports and what the dashboard compares to
+    the Commercial budget.
+    """
+    month_keys = _pl_month_keys(report)
+    if not month_keys:
+        return {}
+
+    def walk(rows):
+        for row in rows or []:
+            summary = row.get("Summary", {}).get("ColData") or []
+            leaf = row.get("ColData") or []
+            header = row.get("Header", {}).get("ColData") or []
+            # Section summary first: it is the account total including sub-accounts.
+            if summary and _label_matches(summary[0].get("value"), hints):
+                return summary
+            if leaf and _label_matches(leaf[0].get("value"), hints):
+                return leaf
+            # A section whose header names the account but whose summary is labelled
+            # some other way — still take the summary, it holds the totals.
+            if header and _label_matches(header[0].get("value"), hints) and summary:
+                return summary
+            found = walk(row.get("Rows", {}).get("Row", []))
+            if found:
+                return found
+        return None
+
+    cells = walk(report.get("Rows", {}).get("Row", []))
+    if not cells:
+        return {}
+
+    values = {}
+    for key, cell in zip(month_keys, cells):
+        if not key:
+            continue
+        try:
+            values[key] = round(float(cell.get("value") or 0), 2)
+        except (TypeError, ValueError):
+            values[key] = 0.0
+    return values
+
+
 def build_summary(invoices: list, income_by_month: list, raw_report, bank_accounts: list,
-                  credit_card_accounts: list | None = None) -> dict:
+                  credit_card_accounts: list | None = None, realm: str | None = None) -> dict:
     """
     Precomputed aggregates so dashboard refreshes read a small block instead of
     re-deriving from thousands of invoices. All derivable client-side, computed
@@ -424,6 +517,31 @@ def build_summary(invoices: list, income_by_month: list, raw_report, bank_accoun
         expenses_by_month = parse_pl_line_by_month(raw_report, "Total Expenses")
         net_income_by_month = parse_pl_line_by_month(raw_report, "Net Income")
 
+    # Commercial revenue by month, read from the P&L INCOME ACCOUNT (4200) rather
+    # than the invoice CLASS field. QBO's Commercial class is applied
+    # inconsistently — June 2026's commercial invoices are classed and tie to the
+    # account exactly, July's largely are not — so
+    # billedByClassMonth["Commercial"] understates the segment and cannot carry a
+    # QTD/YTD series. Account 4200 is the reliable lens and is what the
+    # dashboard's Commercial goal bar reads.
+    #
+    # APC only. PRO's "4200 Commercial-4200" is a DIFFERENT account (commercial
+    # installation revenue) on a different chart of accounts, and nothing in the
+    # dashboard compares it to APC's Commercial budget — so it is deliberately not
+    # emitted. PRO also books no classes at all (every PRO invoice line comes back
+    # Unclassified), which is why PRO gets one honest total revenue bar instead of
+    # segment bars.
+    commercial_by_month = {}
+    if raw_report and realm == "APC":
+        commercial_by_month = parse_pl_account_by_month(raw_report, COMMERCIAL_ACCOUNT_HINTS)
+        if commercial_by_month:
+            print(f"  commercialByMonth: {len(commercial_by_month)} months "
+                  f"from the P&L 4200 Commercial Sales row.")
+        else:
+            print("  WARNING: no '4200 Commercial Sales' row found in the P&L — "
+                  "commercialByMonth is empty. The account was probably renamed or "
+                  "renumbered; add a hint to COMMERCIAL_ACCOUNT_HINTS.")
+
     # Flag anomalies for the dashboard's Needs Attention panel — a negative
     # bank balance is almost always a books problem (unreconciled register,
     # deposits parked in Undeposited Funds, duplicated expenses) or a
@@ -459,6 +577,10 @@ def build_summary(invoices: list, income_by_month: list, raw_report, bank_accoun
         },
         "expensesByMonth": expenses_by_month,
         "netIncomeByMonth": net_income_by_month,
+        # {"YYYY-MM": float} — accrual/invoice-date basis, from P&L account 4200.
+        # Empty for PRO by design. See the comment above for why this is not
+        # derived from billedByClassMonth.
+        "commercialByMonth": commercial_by_month,
     }
 
 
@@ -565,7 +687,10 @@ def process_company(company: dict) -> None:
         print(f"WARNING: income-by-month pull failed for {company['name']}: {exc}")
         income_by_month, raw_report = [], None
 
-    summary = build_summary(invoices, income_by_month, raw_report, bank_accounts, credit_cards)
+    summary = build_summary(
+        invoices, income_by_month, raw_report, bank_accounts, credit_cards,
+        realm=company["name"],
+    )
 
     payload = {
         "realm": company["name"],
@@ -581,7 +706,15 @@ def process_company(company: dict) -> None:
             "invoiceCount": len(invoices),
             "lookbackMonths": LOOKBACK_MONTHS,
             "pulledThrough": today,
-            "schemaVersion": 3,
+            "schemaVersion": 4,
+            "schemaNotes": (
+                "v4: summary.commercialByMonth added (APC realm only) — monthly "
+                "'Total 4200 Commercial Sales' from the P&L, accrual/invoice-date "
+                "basis, keyed 'YYYY-MM'. Consumers should prefer it over "
+                "summary.billedByClassMonth['Commercial'], which understates the "
+                "segment because the QBO Commercial class is applied "
+                "inconsistently. v3 fields are unchanged and still populated."
+            ),
         },
     }
 
